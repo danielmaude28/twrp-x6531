@@ -53,6 +53,8 @@ jobs:
       - name: Bongkar image
         run: |
           set -e
+          mkdir -p tools
+          curl -fsSL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT" | base64 -d > tools/unpack_bootimg.py
           python3 tools/unpack_bootimg.py --boot_img imgs/boot.img --out out/boot
           python3 tools/unpack_bootimg.py --boot_img imgs/vendor_boot.img --out out/vendor_boot
           ext() {
