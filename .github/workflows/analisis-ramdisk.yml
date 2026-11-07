@@ -1,0 +1,56 @@
+name: Analisis ramdisk
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag Release"
+        required: true
+        default: "dump1"
+
+permissions:
+  contents: read
+
+jobs:
+  analisis:
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Siapkan
+        run: sudo apt-get update && sudo apt-get install -y lz4 cpio
+      - name: Bongkar dan kumpulkan info
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p imgs tools out
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "boot.img" --pattern "vendor_boot.img" --dir imgs
+          curl -fsSL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT" | base64 -d > tools/unpack_bootimg.py
+          python3 tools/unpack_bootimg.py --boot_img imgs/boot.img --out out/boot
+          python3 tools/unpack_bootimg.py --boot_img imgs/vendor_boot.img --out out/vendor_boot
+          ext() {
+            mkdir -p "$2"
+            ( lz4 -dc "$1" 2>/dev/null || gzip -dc "$1" 2>/dev/null || cat "$1" ) | ( cd "$2" && cpio -idm --no-absolute-filenames 2>/dev/null ) || true
+          }
+          ext out/vendor_boot/vendor_ramdisk00 out/rd_vendor
+          ext out/boot/ramdisk out/rd_boot
+          set +e
+          M=out/rd_vendor/lib/modules
+          {
+            echo "== ukuran =="; ls -l out/vendor_boot out/boot; du -sh out/rd_vendor $M
+            echo "== file selain .ko =="; ls $M | grep -v '\.ko$'
+            echo "== jumlah ko =="; ls $M | grep -c '\.ko$'
+            for f in modules.load modules.load.recovery modules.load.charger; do echo "== $f =="; cat $M/$f; done
+            echo "== modules.dep (25 baris) =="; head -25 $M/modules.dep
+            echo "== modul terkait layar/touch =="; ls $M | grep -iE 'nt36|adaptive|panel|drm|disp|leds|i2c|spi|tpd|touch|gt9|focal|omni'
+            echo "== init.recovery.mt6768.rc =="; cat out/rd_vendor/init.recovery.mt6768.rc
+            echo "== biner di system/bin =="; ls out/rd_vendor/system/bin | head -60
+            echo "== first_stage_ramdisk =="; ls -R out/rd_vendor/first_stage_ramdisk | head -50
+            echo "== ramdisk boot =="; ls -R out/rd_boot | head -50
+            echo "== bootconfig =="; cat out/vendor_boot/bootconfig
+          } > ramdisk-info.txt 2>&1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramdisk-info
+          path: ramdisk-info.txt
