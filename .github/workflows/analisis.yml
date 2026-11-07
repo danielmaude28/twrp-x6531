@@ -1,0 +1,62 @@
+name: Analisis image HP
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag Release berisi boot.img, vendor_boot.img, init_boot.img, dtbo.img"
+        required: true
+
+jobs:
+  analisis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil image dari Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p img
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" --dir img
+          ls -lh img
+
+      - name: Pasang tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 cpio
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg tools
+
+      - name: Bongkar image
+        run: |
+          mkdir -p out
+          for n in boot vendor_boot init_boot; do
+            echo "===== $n ====="
+            python3 tools/unpack_bootimg.py --boot_img "img/$n.img" --out "out/$n" --format=mkbootimg || echo "gagal: $n"
+          done 2>&1 | tee out/header.txt
+
+      - name: Ekstrak ramdisk dan tampilkan isinya
+        run: |
+          ext() {
+            src=$(realpath "$1"); mkdir -p "$2"; cd "$2"
+            (lz4 -dc "$src" 2>/dev/null || gzip -dc "$src" 2>/dev/null || cat "$src") | cpio -idm 2>/dev/null
+            cd - >/dev/null
+          }
+          for r in out/vendor_boot/vendor_ramdisk*; do
+            [ -f "$r" ] && ext "$r" "out/rd_vendor_$(basename "$r")"
+          done
+          [ -f out/init_boot/ramdisk ] && ext out/init_boot/ramdisk out/rd_init
+          [ -f out/boot/ramdisk ] && ext out/boot/ramdisk out/rd_boot
+          {
+            echo "===== FSTAB ====="
+            find out -name "fstab*" -type f -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \;
+            echo "===== MODUL KERNEL (30 pertama) ====="
+            find out -name "*.ko" | head -30
+            echo "===== ISI RAMDISK ====="
+            ls out/rd_* 2>&1
+          } 2>&1 | tee out/isi.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hasil-analisis
+          path: |
+            out/header.txt
+            out/isi.txt
