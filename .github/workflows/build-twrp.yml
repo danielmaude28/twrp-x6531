@@ -1,0 +1,269 @@
+name: Build TWRP vendor_boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag Release berisi boot.img dan vendor_boot.img"
+        required: true
+        default: "dump1"
+      manifest_branch:
+        description: "Branch minimal manifest TWRP"
+        required: true
+        default: "twrp-12.1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    env:
+      TAG: ${{ inputs.release_tag }}
+      BRANCH: ${{ inputs.manifest_branch }}
+      DT: twrp/device/infinix/X6531B
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bebaskan disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Pasang dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig lz4 cpio python3 python-is-python3 bc rsync libssl-dev
+          sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          git config --global color.ui false
+
+      - name: Ambil image dari Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p imgs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "boot.img" --pattern "vendor_boot.img" --dir imgs
+          ls -l imgs
+
+      - name: Bongkar image
+        run: |
+          set -e
+          python3 tools/unpack_bootimg.py --boot_img imgs/boot.img --out out/boot
+          python3 tools/unpack_bootimg.py --boot_img imgs/vendor_boot.img --out out/vendor_boot
+          ext() {
+            mkdir -p "$2"
+            ( lz4 -dc "$1" 2>/dev/null || gzip -dc "$1" 2>/dev/null || cat "$1" ) | ( cd "$2" && cpio -idm --no-absolute-filenames 2>/dev/null ) || true
+          }
+          ext out/vendor_boot/vendor_ramdisk00 out/rd_vendor
+          ls -l out/boot out/vendor_boot
+          ls out/rd_vendor/lib/modules | head -n 40
+          echo "== bootconfig =="
+          cat out/vendor_boot/bootconfig || true
+
+      - name: Sync source TWRP
+        run: |
+          mkdir twrp
+          cd twrp
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b "$BRANCH"
+          repo sync -c -j8 --force-sync --no-clone-bundle --no-tags --optimized-fetch -q
+          df -h /
+
+      - name: Buat device tree X6531B
+        run: |
+          set -e
+          mkdir -p $DT/prebuilt/dtbdir $DT/recovery/root/lib/modules
+          cp out/boot/kernel $DT/prebuilt/kernel
+          cp out/vendor_boot/dtb $DT/prebuilt/dtbdir/stock.dtb
+          cp out/vendor_boot/dtb $DT/prebuilt/dtb
+          if [ -s out/vendor_boot/bootconfig ]; then
+            cp out/vendor_boot/bootconfig $DT/prebuilt/bootconfig
+          else
+            : > $DT/prebuilt/bootconfig
+          fi
+
+          # modul kernel stock ikut dibawa agar layar, touch, dan storage jalan di recovery
+          cp -a out/rd_vendor/lib/modules/. $DT/recovery/root/lib/modules/
+          LIST=""
+          for f in modules.load.recovery modules.load; do
+            if [ -f out/rd_vendor/lib/modules/$f ]; then LIST=out/rd_vendor/lib/modules/$f; break; fi
+          done
+          if [ -n "$LIST" ]; then
+            MODS=$(xargs -n1 basename < "$LIST" | tr '\n' ' ')
+          else
+            MODS=$(cd out/rd_vendor/lib/modules && ls *.ko | tr '\n' ' ')
+          fi
+          printf 'TW_LOAD_VENDOR_MODULES := "%s"\nTW_LOAD_VENDOR_BOOT_MODULES := true\n' "$MODS" > $DT/modules.mk
+
+          cat > $DT/AndroidProducts.mk <<'EOF'
+          PRODUCT_MAKEFILES := \
+              $(LOCAL_DIR)/twrp_X6531B.mk
+
+          COMMON_LUNCH_CHOICES := \
+              twrp_X6531B-eng \
+              twrp_X6531B-userdebug
+          EOF
+
+          cat > $DT/twrp_X6531B.mk <<'EOF'
+          $(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit_only.mk)
+          $(call inherit-product, $(SRC_TARGET_DIR)/product/base.mk)
+          $(call inherit-product, vendor/twrp/config/common.mk)
+          $(call inherit-product, device/infinix/X6531B/device.mk)
+
+          PRODUCT_DEVICE := X6531B
+          PRODUCT_NAME := twrp_X6531B
+          PRODUCT_BRAND := Infinix
+          PRODUCT_MODEL := Infinix Hot 50i
+          PRODUCT_MANUFACTURER := INFINIX
+          EOF
+
+          cat > $DT/device.mk <<'EOF'
+          LOCAL_PATH := device/infinix/X6531B
+
+          PRODUCT_USE_DYNAMIC_PARTITIONS := true
+
+          AB_OTA_UPDATER := true
+          AB_OTA_PARTITIONS += \
+              boot \
+              dtbo \
+              vendor_boot \
+              vbmeta \
+              vbmeta_system \
+              vbmeta_vendor \
+              system \
+              system_ext \
+              product \
+              vendor
+
+          PRODUCT_PACKAGES += \
+              update_engine \
+              update_engine_sideload \
+              update_verifier
+          EOF
+
+          cat > $DT/BoardConfig.mk <<'EOF'
+          DEVICE_PATH := device/infinix/X6531B
+
+          # Arsitektur (MT6768, 64-bit saja untuk recovery)
+          TARGET_ARCH := arm64
+          TARGET_ARCH_VARIANT := armv8-a
+          TARGET_CPU_ABI := arm64-v8a
+          TARGET_CPU_ABI2 :=
+          TARGET_CPU_VARIANT := generic
+          TARGET_CPU_VARIANT_RUNTIME := cortex-a75
+
+          TARGET_BOARD_PLATFORM := mt6768
+          TARGET_BOOTLOADER_BOARD_NAME := X6531B
+          TARGET_NO_BOOTLOADER := true
+          TARGET_NO_RADIOIMAGE := true
+
+          # Kernel dan DTB stock (kernel tetap dipakai dari partisi boot)
+          TARGET_PREBUILT_KERNEL := $(DEVICE_PATH)/prebuilt/kernel
+          TARGET_PREBUILT_DTB := $(DEVICE_PATH)/prebuilt/dtb
+          BOARD_PREBUILT_DTBIMAGE_DIR := $(DEVICE_PATH)/prebuilt/dtbdir
+          BOARD_INCLUDE_DTB_IN_BOOTIMG := true
+          BOARD_EXCLUDE_KERNEL_FROM_RECOVERY_IMAGE := true
+
+          # Header v4 sesuai hasil unpack vendor_boot stock
+          BOARD_BOOT_HEADER_VERSION := 4
+          BOARD_KERNEL_BASE := 0x00000000
+          BOARD_KERNEL_PAGESIZE := 4096
+          BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2
+          BOARD_BOOTCONFIG := $(shell cat $(DEVICE_PATH)/prebuilt/bootconfig | tr '\n' ' ')
+          BOARD_MKBOOTIMG_ARGS += --header_version 4
+          BOARD_MKBOOTIMG_ARGS += --kernel_offset 0x40080000
+          BOARD_MKBOOTIMG_ARGS += --ramdisk_offset 0x47c80000
+          BOARD_MKBOOTIMG_ARGS += --tags_offset 0x4bc80000
+          BOARD_MKBOOTIMG_ARGS += --dtb_offset 0x4bc80000
+
+          # Recovery ada di dalam vendor_boot (tidak ada partisi recovery)
+          BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true
+          BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true
+          BOARD_USES_RECOVERY_AS_BOOT := false
+          BOARD_BOOTIMAGE_PARTITION_SIZE := 33554432
+          BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE := 67108864
+
+          # A/B dan dynamic partitions
+          AB_OTA_UPDATER := true
+          BOARD_BUILD_SYSTEM_ROOT_IMAGE := false
+          TARGET_COPY_OUT_VENDOR := vendor
+          TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/recovery.fstab
+          BOARD_USES_METADATA_PARTITION := true
+
+          # Filesystem
+          TARGET_USERIMAGES_USE_EXT4 := true
+          TARGET_USERIMAGES_USE_F2FS := true
+          BOARD_USERDATAIMAGE_FILE_SYSTEM_TYPE := f2fs
+
+          # Versi dummy agar kompatibel dengan ROM apa pun
+          PLATFORM_VERSION := 16.1.0
+          PLATFORM_SECURITY_PATCH := 2099-12-31
+          VENDOR_SECURITY_PATCH := 2099-12-31
+
+          # TWRP
+          TW_THEME := portrait_hdpi
+          TW_EXTRA_LANGUAGES := true
+          TW_USE_TOOLBOX := true
+          TW_INCLUDE_REPACKTOOLS := true
+          TW_INCLUDE_RESETPROP := true
+          TW_BRIGHTNESS_PATH := "/sys/class/leds/lcd-backlight/brightness"
+          TW_DEFAULT_BRIGHTNESS := 120
+          TARGET_RECOVERY_PIXEL_FORMAT := "RGBX_8888"
+          RECOVERY_SDCARD_ON_DATA := true
+          TARGET_USES_MKE2FS := true
+          BOARD_HAS_NO_SELECT_BUTTON := true
+
+          # Dekripsi /data sengaja dimatikan dulu; aktifkan setelah TWRP berhasil boot
+          # TW_INCLUDE_CRYPTO := true
+          # TW_INCLUDE_CRYPTO_FBE := true
+          # TW_INCLUDE_FBE_METADATA_DECRYPT := true
+
+          -include $(DEVICE_PATH)/modules.mk
+          EOF
+
+          cat > $DT/recovery.fstab <<'EOF'
+          # mount point   fstype   device                              flags
+          /system         erofs    system                              flags=display="System";logical;slotselect
+          /system_ext     erofs    system_ext                          flags=display="System_Ext";logical;slotselect
+          /vendor         erofs    vendor                              flags=display="Vendor";logical;slotselect
+          /product        erofs    product                             flags=display="Product";logical;slotselect
+
+          /data           f2fs     /dev/block/by-name/userdata         flags=display="Data";wipeingui;wipeduringfactoryreset
+          /metadata       ext4     /dev/block/by-name/md_udc           flags=display="Metadata"
+
+          /boot           emmc     /dev/block/by-name/boot             flags=display="Boot";backup=1;flashimg=1;slotselect
+          /vendor_boot    emmc     /dev/block/by-name/vendor_boot      flags=display="Vendor_Boot";backup=1;flashimg=1;slotselect
+          /dtbo           emmc     /dev/block/by-name/dtbo             flags=display="Dtbo";backup=1;flashimg=1;slotselect
+          /vbmeta         emmc     /dev/block/by-name/vbmeta           flags=display="Vbmeta";backup=1;flashimg=1;slotselect
+          /misc           emmc     /dev/block/by-name/misc
+
+          /external_sd    auto     /dev/block/mmcblk1p1 /dev/block/mmcblk1   flags=display="MicroSD";storage;wipeingui;removable
+          /usb_otg        auto     /dev/block/sda1 /dev/block/sda            flags=display="USB-OTG";storage;wipeingui;removable
+          EOF
+
+          find $DT -maxdepth 2 -not -path '*/lib/modules/*' | sort
+
+      - name: Build vendor_boot.img
+        run: |
+          cd twrp
+          export LC_ALL=C
+          export ALLOW_MISSING_DEPENDENCIES=true
+          set +e
+          source build/envsetup.sh
+          lunch twrp_X6531B-eng
+          mka vendorbootimage -j"$(nproc)" 2>&1 | tee ../build.log
+          test -f out/target/product/X6531B/vendor_boot.img
+
+      - name: Simpan hasil
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-x6531b
+          path: |
+            twrp/out/target/product/X6531B/vendor_boot.img
+            build.log
+          if-no-files-found: warn
