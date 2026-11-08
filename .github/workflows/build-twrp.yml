@@ -48,6 +48,7 @@ jobs:
         run: |
           mkdir -p imgs
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "boot.img" --pattern "vendor_boot.img" --dir imgs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "novatek_*.bin" --dir imgs || echo "firmware touch tidak ada di Release"
           ls -l imgs
 
       - name: Bongkar image
@@ -88,18 +89,11 @@ jobs:
             : > $DT/prebuilt/bootconfig
           fi
 
-          # modul kernel stock ikut dibawa agar layar, touch, dan storage jalan di recovery
+          # modul kernel stock (192 .ko, modules.load.recovery, modules.dep) ikut dibawa; first-stage init memuatnya
           cp -a out/rd_vendor/lib/modules/. $DT/recovery/root/lib/modules/
-          LIST=""
-          for f in modules.load.recovery modules.load; do
-            if [ -f out/rd_vendor/lib/modules/$f ]; then LIST=out/rd_vendor/lib/modules/$f; break; fi
-          done
-          if [ -n "$LIST" ]; then
-            MODS=$(xargs -n1 basename < "$LIST" | tr '\n' ' ')
-          else
-            MODS=$(cd out/rd_vendor/lib/modules && ls *.ko | tr '\n' ' ')
-          fi
-          printf 'TW_LOAD_VENDOR_MODULES := "%s"\nTW_LOAD_VENDOR_BOOT_MODULES := true\n' "$MODS" > $DT/modules.mk
+          # firmware touch Novatek: /vendor belum ter-mount saat modul dimuat, jadi ikut di ramdisk
+          mkdir -p $DT/recovery/root/vendor/firmware
+          cp imgs/novatek_*.bin $DT/recovery/root/vendor/firmware/ 2>/dev/null || echo "tanpa firmware touch"
 
           cat > $DT/AndroidProducts.mk <<'EOF'
           PRODUCT_MAKEFILES := \
@@ -213,7 +207,8 @@ jobs:
           TW_INCLUDE_REPACKTOOLS := true
           TW_INCLUDE_RESETPROP := true
           TW_BRIGHTNESS_PATH := "/sys/class/leds/lcd-backlight/brightness"
-          TW_DEFAULT_BRIGHTNESS := 120
+          TW_MAX_BRIGHTNESS := 4095
+          TW_DEFAULT_BRIGHTNESS := 1200
           TARGET_RECOVERY_PIXEL_FORMAT := "RGBX_8888"
           RECOVERY_SDCARD_ON_DATA := true
           TARGET_USES_MKE2FS := true
@@ -224,15 +219,14 @@ jobs:
           # TW_INCLUDE_CRYPTO_FBE := true
           # TW_INCLUDE_FBE_METADATA_DECRYPT := true
 
-          -include $(DEVICE_PATH)/modules.mk
           EOF
 
           cat > $DT/recovery.fstab <<'EOF'
           # mount point   fstype   device                              flags
-          /system         erofs    system                              flags=display="System";logical;slotselect
-          /system_ext     erofs    system_ext                          flags=display="System_Ext";logical;slotselect
-          /vendor         erofs    vendor                              flags=display="Vendor";logical;slotselect
-          /product        erofs    product                             flags=display="Product";logical;slotselect
+          /system         ext4     system                              flags=display="System";logical;slotselect
+          /system_ext     ext4     system_ext                          flags=display="System_Ext";logical;slotselect
+          /vendor         ext4     vendor                              flags=display="Vendor";logical;slotselect
+          /product        ext4     product                             flags=display="Product";logical;slotselect
 
           /data           f2fs     /dev/block/by-name/userdata         flags=display="Data";wipeingui;wipeduringfactoryreset
           /metadata       ext4     /dev/block/by-name/md_udc           flags=display="Metadata"
